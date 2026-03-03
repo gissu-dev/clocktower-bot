@@ -9,6 +9,10 @@ __pycache__/
 # Local environment secrets
 .env
 
+# Runtime state
+countdowns.json
+*.log
+
 # OS/editor noise
 .DS_Store
 Thumbs.db
