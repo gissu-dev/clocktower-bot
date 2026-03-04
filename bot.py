@@ -2,10 +2,11 @@ import os
 import asyncio
 import re
 import json
+import shutil
 from datetime import datetime, timedelta
 
-import discord
-from discord.ext import commands, tasks
+import disnake as discord
+from disnake.ext import commands, tasks
 
 from config import (
     TOKEN,
@@ -40,6 +41,10 @@ clocktower_enabled = True  # !clock on/off changes this
 last_rung_hour = None  # Keeps track of the last hour we rang so we don't double-ring
 active_countdowns = {}  # channel_id -> asyncio.Task
 countdown_recovery_done = False
+bell_play_lock = asyncio.Lock()  # Prevent overlapping voice joins/plays
+last_bell_attempt_monotonic = 0.0
+BELL_MIN_GAP_SECONDS = 8.0
+voice_connect_blocked_reason = ""  # Set when Discord rejects non-DAVE voice connects (code 4017)
 
 # ---------- INTENTS SETUP ----------
 
@@ -50,6 +55,16 @@ intents.voice_states = True  # So we can see voice channel states
 
 # Bot with "!" as prefix
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+def get_voice_stack_status() -> str:
+    try:
+        import disnake.voice_client as voice_client_mod
+
+        has_dave = bool(getattr(voice_client_mod, "has_dave", False))
+        return f"Voice stack: disnake {discord.__version__}, dave.py loaded={has_dave}"
+    except Exception as e:
+        return f"Voice stack check failed: {e}"
 
 
 # ---------- HELPER: PERMISSION CHECK FOR !bell ----------
@@ -266,58 +281,140 @@ def parse_when_input(when_text: str) -> tuple[datetime | None, str | None]:
 
 # ---------- HELPER: PLAY THE BELL IN THE VOICE CHANNEL ----------
 
-async def play_bell_once():
+async def play_bell_once(trigger: str = "unknown") -> bool:
     """Connects to the configured voice channel, plays the bell sound once, then disconnects."""
-    guild = bot.get_guild(GUILD_ID)
-    if guild is None:
-        print("Guild not found. Check GUILD_ID.")
-        return
+    global last_bell_attempt_monotonic
+    global voice_connect_blocked_reason
+    global clocktower_enabled
 
-    channel = guild.get_channel(VOICE_CHANNEL_ID)
-    if channel is None or not isinstance(channel, discord.VoiceChannel):
-        print("Voice channel not found or is not a voice channel. Check VOICE_CHANNEL_ID.")
-        return
+    async with bell_play_lock:
+        now_mono = asyncio.get_running_loop().time()
+        since_last = now_mono - last_bell_attempt_monotonic
+        if since_last < BELL_MIN_GAP_SECONDS:
+            print(
+                f"Skipping bell trigger {trigger!r}: only {since_last:.2f}s since previous bell attempt."
+            )
+            return False
+        last_bell_attempt_monotonic = now_mono
 
-    # Check that the sound file exists
-    if not os.path.isfile(BELL_FILE):
-        print(f"Bell file not found at: {BELL_FILE}")
-        return
+        print(f"Bell trigger received: {trigger!r}")
 
-    voice_client = guild.voice_client
+        guild = bot.get_guild(GUILD_ID)
+        if guild is None:
+            print("Guild not found. Check GUILD_ID.")
+            return False
 
-    try:
-        if voice_client and voice_client.is_connected():
-            # Move to correct channel if already connected somewhere in this guild
-            if voice_client.channel.id != VOICE_CHANNEL_ID:
-                await voice_client.move_to(channel)
-        else:
-            # Not connected yet, connect now
-            voice_client = await channel.connect()
+        channel = guild.get_channel(VOICE_CHANNEL_ID)
+        if channel is None or not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            print("Voice channel not found or is not a voice channel. Check VOICE_CHANNEL_ID.")
+            return False
 
-        # Create FFmpeg audio source
-        audio_source = discord.FFmpegPCMAudio(BELL_FILE)
+        if voice_connect_blocked_reason and isinstance(channel, discord.VoiceChannel):
+            print(f"Bell blocked: {voice_connect_blocked_reason}")
+            return False
 
-        # If something is already playing, stop it
-        if voice_client.is_playing():
-            voice_client.stop()
+        # Check that the sound file exists
+        if not os.path.isfile(BELL_FILE):
+            print(f"Bell file not found at: {BELL_FILE}")
+            return False
 
-        voice_client.play(audio_source)
-        print("Bell is playing...")
+        ffmpeg_path = shutil.which("ffmpeg")
+        if not ffmpeg_path:
+            print("ffmpeg was not found on PATH. Install ffmpeg and restart the bot shell.")
+            return False
 
-        # Wait until playback finishes
-        while voice_client.is_playing():
-            await asyncio.sleep(0.5)
+        me = guild.me or guild.get_member(bot.user.id if bot.user else 0)
+        if me is None:
+            print("Could not resolve bot member object in guild.")
+            return False
 
-        print("Bell finished playing.")
+        perms = channel.permissions_for(me)
+        if not perms.connect:
+            print(f"Bot lacks CONNECT permission in voice channel ID: {channel.id}")
+            return False
+        if not perms.speak:
+            print(f"Bot lacks SPEAK permission in voice channel ID: {channel.id}")
+            return False
 
-    except Exception as e:
-        print(f"Error while playing bell: {e}")
+        voice_client = guild.voice_client
+        success = False
 
-    finally:
-        # Disconnect after playing
-        if voice_client and voice_client.is_connected():
-            await voice_client.disconnect()
-            print("Disconnected from voice channel.")
+        try:
+            if voice_client and voice_client.is_connected():
+                # Move to correct channel if already connected somewhere in this guild
+                if voice_client.channel.id != VOICE_CHANNEL_ID:
+                    await voice_client.move_to(channel)
+            else:
+                # Not connected yet, connect now
+                voice_client = await channel.connect(reconnect=False, timeout=20.0)
+
+            # Create FFmpeg audio source
+            audio_source = discord.FFmpegPCMAudio(BELL_FILE, executable=ffmpeg_path)
+
+            # If something is already playing, stop it
+            if voice_client.is_playing():
+                voice_client.stop()
+
+            playback_done = asyncio.Event()
+            playback_error = None
+
+            def on_playback_done(error):
+                nonlocal playback_error
+                playback_error = error
+                bot.loop.call_soon_threadsafe(playback_done.set)
+
+            voice_client.play(audio_source, after=on_playback_done)
+            print(f"Bell playback started in channel ID {channel.id}.")
+
+            # Wait for ffmpeg/voice playback thread to complete or error out
+            await asyncio.wait_for(playback_done.wait(), timeout=120)
+
+            if playback_error:
+                print(f"Bell playback error: {playback_error}")
+            else:
+                print("Bell finished playing.")
+                success = True
+
+        except asyncio.TimeoutError:
+            print("Timed out while waiting for bell playback to complete.")
+            if voice_client and voice_client.is_connected() and voice_client.is_playing():
+                voice_client.stop()
+        except discord.ConnectionClosed as e:
+            if getattr(e, "code", None) == 4017:
+                try:
+                    import disnake.voice_client as voice_client_mod
+
+                    has_dave = bool(getattr(voice_client_mod, "has_dave", False))
+                except Exception:
+                    has_dave = False
+
+                if not has_dave:
+                    voice_connect_blocked_reason = (
+                        "Discord rejected non-stage voice connect with code 4017 "
+                        "(DAVE/E2EE required for regular voice channels)."
+                    )
+                    clocktower_enabled = False
+                    print(
+                        "Voice connect failed with code 4017 and dave.py is not active. "
+                        "Hourly bell has been auto-disabled. Use a Stage channel or install dave.py."
+                    )
+                else:
+                    print(
+                        "Voice connect failed with code 4017 even though dave.py is active. "
+                        "This may be a Discord-side voice routing issue; retry shortly."
+                    )
+            else:
+                print(f"Voice connection closed during bell playback setup: {e}")
+        except Exception as e:
+            print(f"Error while playing bell: {e}")
+
+        finally:
+            # Disconnect after playing
+            if voice_client and voice_client.is_connected():
+                await voice_client.disconnect()
+                print("Disconnected from voice channel.")
+
+        return success
 
 
 def load_countdown_state() -> dict:
@@ -475,6 +572,8 @@ async def run_countdown(
 @bot.command(name="bell")
 async def bell_command(ctx: commands.Context):
     """Manually trigger the bell: bot joins vc, plays sound, leaves."""
+    global voice_connect_blocked_reason
+
     # Permission check first to avoid unnecessary work
     if (not bell_public_enabled) and (not has_bell_permission(ctx)):
         await ctx.send("You do not have permission to use !bell.")
@@ -491,7 +590,15 @@ async def bell_command(ctx: commands.Context):
         return
 
     await ctx.send("Ringing the bell once...")
-    await play_bell_once()
+    ok = await play_bell_once(trigger=f"manual by {ctx.author} ({ctx.author.id})")
+    if not ok:
+        if voice_connect_blocked_reason:
+            await ctx.send(
+                "Bell failed: Discord now requires DAVE/E2EE for regular voice channels. "
+                "Use a Stage channel for now."
+            )
+        else:
+            await ctx.send("Bell failed to play. Check the bot terminal logs for the exact voice error.")
 
 
 # ---------- COMMAND: !bellpublic (toggle public access to !bell) ----------
@@ -690,7 +797,7 @@ async def hourly_bell_task():
         return
 
     channel = guild.get_channel(VOICE_CHANNEL_ID)
-    if channel is None or not isinstance(channel, discord.VoiceChannel):
+    if channel is None or not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
         print("Hourly task: voice channel not found or is not a voice channel.")
         return
 
@@ -706,7 +813,7 @@ async def hourly_bell_task():
         return
 
     print(f"Hourly task: ringing bell at hour {current_hour:02d}:00.")
-    await play_bell_once()
+    await play_bell_once(trigger="hourly task")
     last_rung_hour = current_hour
 
 
@@ -756,6 +863,7 @@ async def on_ready():
 
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print("------")
+    print(get_voice_stack_status())
 
     # Simple check that our audio file exists
     if not os.path.isfile(BELL_FILE):
